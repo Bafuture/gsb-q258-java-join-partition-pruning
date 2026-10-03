@@ -30,3 +30,65 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 258）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+## 实现说明
+
+核心代码位于 `src/main/java/com/example/gsb/join`：
+
+| 类 | 职责 |
+|----|------|
+| `PartitionScheme` | 范围分区方案（半开区间 `[lo,hi)`，`Long.MAX_VALUE` 表示 +inf），支持等宽分区、二分定位、区间交集求分区 |
+| `PartitionedTable` | 按分区键物理分发数据的表 |
+| `Predicate` | sealed 条件模型：`KeyValue`（键-常量）、`KeyIn`（IN）、`KeyKey`（两侧键比较）、`Custom`（无法分析的黑盒条件） |
+| `KeyDomain` | 分区键取值域（区间并集），负责边界推导与交/并 |
+| `PartitionPruner` | 条件分析 -> 两侧候选分区 -> 分区对可行性过滤，输出 `PruningPlan`（含兜底原因与推导轨迹） |
+| `PartitionJoinExecutor` | 按分区对并行嵌套循环连接，固定线程池控制并发度 |
+| `JoinStats` | 分区对总数、参与数、剪枝率、各分区对评估/输出条数 |
+
+### 边界推导规则
+
+分区采用半开区间 `[下界, 上界)`。单个谓词推导为取值域：
+
+- `k = v`  -> `[v, v+1)`
+- `k > v`  -> `[v+1, +inf)`；`k >= v` -> `[v, +inf)`
+- `k < v`  -> `(-inf, v)`；`k <= v` -> `(-inf, v+1)`
+- `k != v` -> `(-inf, v) ∪ [v+1, +inf)`（只去掉单点，含该点的分区仍保留）
+- `k IN (v1..vn)` -> 各 `[vi, vi+1)` 的并集（去重、合并相邻区间）
+- 多个谓词之间取交集（AND）；域与每个分区区间求交，只保留命中分区
+- 两侧分区键比较对分区对做可行性过滤：
+  - `=`：两分区区间有交集（同方案下只保留相同分区 id 的对角对）
+  - `<`：左区间最小值 `<` 右区间最大值；`<=`：左最小 `<=` 右最大
+  - `>`：左区间最大值 `>` 右区间最小值；`>=`：左最大 `>=` 右最小
+  - `<>`：除非两区间是同一个单点区间，否则保留
+
+### 兜底策略
+
+以下情况退回全分区扫描，并在 `PruningPlan.fallbackReason()` / `JoinStats` 中标注原因：
+
+- 出现无法分析的 `Predicate.custom(...)`（无法保证剪枝正确性）
+- 连接条件完全未引用任何一侧分区键（无分区范围可推导）
+
+仅引用非分区键的谓词不触发兜底，作为残余条件在连接时逐行评估。兜底时仍逐行评估完整条件，结果正确。
+
+### 正确性保证
+
+每个被执行的行对都重新评估**完整**原始条件，剪枝只决定“哪些分区对需要扫描”；
+`PruningCorrectnessTest` 用固定种子随机生成 60 组数据/条件，与全量笛卡尔积再过滤逐行比对，
+并额外断言“被排除的分区对内不存在任何能满足条件的行对”。
+
+### 用法示例
+
+```java
+PartitionScheme scheme = PartitionScheme.equalWidth("k", 0, 10, 4); // [0,10)[10,20)[20,30)[30,+inf)
+PartitionedTable left  = PartitionedTable.builder("orders", scheme).addRows(rows).build();
+PartitionedTable right = PartitionedTable.builder("items",  scheme).addRows(rows).build();
+
+var result = new PartitionJoinExecutor().join(left, right, List.of(
+        Predicate.eq(Predicate.Ref.left("k"), Predicate.Ref.right("k")),  // 分区键等值
+        Predicate.in(Predicate.Ref.right("k"), 15, 25),                   // IN 推导
+        Predicate.le(Predicate.Ref.left("amount"), Predicate.Ref.right("amount"))), // 非分区键残余条件
+        new PartitionJoinExecutor.ExecutorConfig(4, PairInterceptor.NONE));
+
+System.out.println(result.stats().summary());
+// 分区对总数=16, 参与=1, 剪枝率=93.75%, 兜底=false, 输出行=...
+```
