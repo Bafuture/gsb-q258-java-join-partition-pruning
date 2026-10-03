@@ -30,3 +30,63 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 258）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+# 实现说明：分区表连接的分区剪枝组件
+
+## 组件结构
+
+| 包 | 关键类 | 职责 |
+|----|--------|------|
+| `com.example.gsb.join.model` | `PartitionedTable` / `Partition` / `Row` | 按同一分区键、同一范围分区方案组织的表；`Partition.scan()` 带扫描计数，用于校验“被剪枝分区不参与扫描” |
+| `com.example.gsb.join.predicate` | `JoinCondition` / `ColumnComparison` / `ColumnValue` / `InList` / `Op` | AND 合取连接条件，支持分区键与非分区键谓词混用 |
+| `com.example.gsb.join.domain` | `KeyDomain` | 分区键取值域（闭区间集合），谓词 → 取值域的边界推导 |
+| `com.example.gsb.join.prune` | `PartitionPruner` / `PrunePlan` / `PruneNote` | 推导两侧参与的分区对，输出剪枝状态、剪枝前后数量对比与兜底原因 |
+| `com.example.gsb.join.exec` | `PartitionJoinService` / `PartitionJoinExecutor` | 按剪枝计划对分区对做并行嵌套循环连接，并发度可配 |
+| `com.example.gsb.join.stats` | `JoinStats` / `PairStats` | 分区对总数、参与数、剪枝率、每分区对读取/比较/命中条数 |
+
+## 剪枝模型
+
+两张表按同一分区键做相同的范围分区（分区区间互不相交、首尾相接）。
+剪枝前分区对总数 = `左分区数 × 右分区数`（N×N）。
+
+### 边界推导规则（谓词 → 分区键取值域，均为闭区间）
+
+- 等值：`pk = v` → 单点域 `[v, v]`
+- 范围：
+  - `pk > v` → `[v+1, MAX]`；`pk >= v` → `[v, MAX]`
+  - `pk < v` → `[MIN, v-1]`；`pk <= v` → `[MIN, v]`
+  - 溢出边界（`pk > MAX`、`pk < MIN`）直接推导出空域
+- IN：`pk IN (v1..vn)` → 各单点域的并集，相邻点自动合并为一个区间；空 IN 列表 → 空域
+- 不等：`pk <> v` 无法收窄取值域，标记为“不可推导”
+- 多个谓词为 AND 关系 → 取值域求交（区间交集）
+
+### 分区对推导规则
+
+1. 单侧分区键谓词把该侧取值域收窄，只保留与取值域相交的分区（分区区间是左闭右开 `[lo, hi)`，边界点归右侧分区）；
+2. 存在分区键等值连接 `l.pk = r.pk` 时：两侧取值域先求交，再仅配对“分区区间相交”的分区对（同方案下即对角线）；
+3. 无等值连接、仅有单侧分区键过滤时：该侧裁剪、另一侧保留全分区，两侧做笛卡尔积，并给出 `PARTIAL_SIDE_RESTRICTION` 警告；
+4. 非分区键谓词（如 `l.region_id = r.region_id`）不参与剪枝，仅记录信息，仍在逐行连接时判定。
+
+### 兜底规则（退回全分区扫描）
+
+以下情形无法安全剪枝，计划状态标记为 `FULL_SCAN_FALLBACK`，参与数退回 N×N，并在 `PruneNote(level=FALLBACK)` 中明确原因：
+
+- `NO_PARTITION_KEY_PREDICATE`：条件中没有任何分区键谓词（如只有非分区键等值连接）；
+- `NON_EQUI_PARTITION_KEY_JOIN`：分区键上的跨表比较不是等值（如 `l.pk > r.pk`）；
+- `UNSUPPORTED_PARTITION_KEY_OPERATOR`：分区键上出现 `<>` 等无法推导取值域的运算符。
+
+兜底只放弃剪枝、不放弃任何谓词判定，因此结果仍与全量连接再过滤一致。
+
+## 并行与统计
+
+- `new PartitionJoinService(并发度)` 或 `new PartitionJoinExecutor(并发度)`：不同分区对提交到固定大小线程池并行连接，并发度强制为正数；
+- 统计输出：`totalPairs`（总数）、`participatingPairs`（参与数）、`pruneRate = 1 - 参与数/总数`，以及每个分区对的左/右读取行数、行对比较次数、命中条数、执行线程与耗时；
+- `PrunePlan.summary()` / `JoinStats.summary()` 直接给出剪枝前后分区对数量对比与兜底原因。
+
+## 验证
+
+- `./mvnw -q verify`：25 个测试全部通过；
+- `PrunedJoinCorrectnessTest` 用 100 组随机分区数/行数/条件（等值、范围、IN、两侧过滤、兜底等 7 种场景）对比“剪枝分区连接”与“全量 N×N 连接后再过滤”的结果多重集，并校验被剪枝分区扫描计数为 0；
+- 其余测试覆盖三类条件的边界推导、剪枝前后数量对比、兜底路径、并发度上限/真实并行、统计字段。
